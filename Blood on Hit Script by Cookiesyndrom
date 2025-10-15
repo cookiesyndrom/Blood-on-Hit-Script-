@@ -1,627 +1,391 @@
--- Realistic Blood VFX System (Single-file submission)
--- This took me more than a hour to comment on everything. By cookiesyndrom.
--- Place this Script in ServerScriptService.
--- Add two children to this Script:
---   1) "blood" (Part) -> template part with decal/mesh/sound
---   2) "attachment" (Attachment) -> contains ParticleEmitter(s)
--- This script creates a RemoteEvent in ReplicatedStorage and also creates
--- a LocalScript in each player's PlayerScripts to provide local-only feedback
+--//====================================================
+--// BLOOD SYSTEM SCRIPT (Reworked for Readability & Style)
+--//====================================================
+--// Author: cookiesyndrom
+--// Purpose: Creates realistic blood effects on NPCs and Players
+--// Note: Structured and commented following Roblox Lua Style Guide as you guys told me.
+--//====================================================
 
--- services
-local TweenService = game:GetService("TweenService")  -- cache tweenservice reference for creating tweens later
-local Players = game:GetService("Players")  -- cache players service for player events and lookups
-local Debris = game:GetService("Debris")  -- cache debris for timed cleanup of transient instances
-local RunService = game:GetService("RunService")  -- cache runservice for heartbeat/render loops
-local ReplicatedStorage = game:GetService("ReplicatedStorage")  -- cache replicatedstorage for remote event storage
-local Workspace = game:GetService("Workspace")  -- cache workspace for raycasts and parenting parts
-local HttpService = game:GetService("HttpService")  -- cached but rarely used, kept for possible ids or serialization
+--//=============================
+--// SERVICE REFERENCES
+--//=============================
+-- Using GetService ensures the same service instance is used consistently across scripts.
+local TweenService = game:GetService("TweenService")
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
 
--- configuration table: centralized tuning for reviewers
-local config = {  -- main tuning blob, accessed by reference for consistent behavior
-	blood = {
-		lifetime = 12,  -- base lifetime in seconds for a blood decal before fade starts
-		fadeout = 2,  -- fade duration in seconds when removing decal
-		dropcount = 5,  -- number of drop rays per damage event for players
-		poolsize = Vector3.new(7, 0.12, 7),  -- target size for death pools when expanded
-		emitcount = 22,  -- default particle emitter emission count when triggered
-		droplets_per_hit = 3,  -- physics droplet spawn attempts per hit location
-	},
-	perf = {
-		maxdrops = 300,  -- maximum active decal objects allowed before skipping spawns
-		maxpools = 60,  -- maximum cached pool objects to keep in memory
-		raydistance = 120,  -- max distance for a single raycast segment
-		max_raycast_attempts = 3,  -- upper bound on ray penetration loops
-	},
-	raycast = {
-		attempts = 3,  -- how many penetration loops to try in smartraycast
-		penetration = 0.12,  -- how far to step forward after hitting a non-solid/transparent object
-		sample_offset = 0.02,  -- small offset used for sampling, kept for potential use
-	},
-	folders = {
-		blood = "BloodFolder",  -- workspace folder name for spawned blood parts
-		npcs = "Npcs",  -- workspace folder name containing npc models
-	},
-	local_script_name = "BloodFXLocal",  -- name used when creating localscript in players
-}
+--//=============================
+--// CONFIGURATION
+--//=============================
+local BLOOD_DELAY = 13.5      -- How long before blood fades
+local BLOOD_PER_HIT = 5       -- Amount of blood decals created per hit
 
--- create or reuse RemoteEvent
-local bloodfxevent = ReplicatedStorage:FindFirstChild("BloodFXEvent")  -- try reuse existing remote
-if not bloodfxevent then
-	bloodfxevent = Instance.new("RemoteEvent")  -- instantiate remoteevent only once to avoid duplicates
-	bloodfxevent.Name = "BloodFXEvent"  -- name it predictably so clients can waitforchild
-	bloodfxevent.Parent = ReplicatedStorage  -- store in replicatedstorage so clients can access it
-end
+--//=============================
+--// HELPER FUNCTIONS
+--//=============================
 
--- =====================================================
--- Metatable pool object for decals/pools (object oriented)
--- =====================================================
-local BloodObj = {}  -- metatable prototype for pooled decal objects
-BloodObj.__index = BloodObj  -- set metamethod so : syntax resolves to BloodObj methods
-
-function BloodObj.new(template)  -- constructor returns table bound to BloodObj
-	local self = setmetatable({}, BloodObj)  -- create instance and set its metatable
-	self.part = nil  -- will hold the cloned part instance when materialized
-	self._template = template  -- keep reference to the template part for cloning on demand
-	self.active = false  -- tracks whether the object is currently active in the world
-	self.createdAt = tick()  -- timestamp of creation for potential age-based pruning
-	return self
-end
-
-function BloodObj:_ensurepart()  -- internal helper to lazily materialize the underlying part
-	if not self.part or not self.part:IsDescendantOf(game) then  -- if no part or it was destroyed/moved out
-		self.part = self._template:Clone()  -- clone template to create a fresh part
-		self.part.Parent = nil  -- keep detached until activation to avoid flicker
-		self.part.Transparency = 1  -- start fully transparent to avoid visual pop until activated
-		self.part.Anchored = true  -- default to anchored so we can position without physics
-		self.part.CanCollide = false  -- disable collisions for decal-like parts
-		self.part.CanTouch = false  -- disable touch events to avoid side effects
-		self.part.CastShadow = false  -- disable shadows for flat decals to save rendering
-	end
-end
-
-function BloodObj:activate(cframe, size, anchored)  -- put the pooled part into the world
-	self:_ensurepart()  -- ensure a part exists before setting properties
-	self.part.CFrame = cframe  -- position/orient the decal to match surface cframe
-	self.part.Size = size  -- set decal dimensions, width/height used by mesh/decal mapping
-	self.part.Transparency = 0  -- make visible immediately
-	self.part.Anchored = (anchored ~= false)  -- anchor by default unless explicitly false
-	local parentFolder = Workspace:FindFirstChild(config.folders.blood) or Workspace  -- find configured folder
-	self.part.Parent = parentFolder  -- parent to workspace folder so it renders and is consistent
-	self.active = true  -- mark as active for pool bookkeeping
-	self.createdAt = tick()  -- update created timestamp for aging logic
-end
-
-function BloodObj:deactivate()  -- detach and hide the pooled object without destroying
-	if self.part then
-		self.part.Parent = nil  -- unparent so it's not in the render hierarchy
-		self.part.Transparency = 1  -- hide it visually to avoid accidental visibility while pooled
-	end
-	self.active = false  -- clear active flag for pool logic
-end
-
--- pool manager
-local pool = {  -- simple free list manager for BloodObj instances
-	available = {},  -- list of inactive objects ready to be reused
-	active = {},  -- list of active objects currently placed in workspace
-	totalcreated = 0,  -- diagnostic counter for how many objects were ever allocated
-}
-
-local function get_from_pool(template)  -- allocate or reuse a BloodObj bound to template
-	local obj = table.remove(pool.available)  -- pop last available object if present
-	if not obj then
-		obj = BloodObj.new(template)  -- lazily construct new object when pool empty
-		pool.totalcreated = pool.totalcreated + 1  -- increment allocation counter
-	end
-	table.insert(pool.active, obj)  -- track as active immediately
-	return obj
-end
-
-local function return_to_pool(obj)  -- gracefully return an object to the available list
-	if not obj then return end  -- defensive nil check
-	for i, v in ipairs(pool.active) do  -- remove from active list by finding exact reference
-		if v == obj then
-			table.remove(pool.active, i)
-			break
-		end
-	end
-	obj:deactivate()  -- hide and detach the underlying part
-	table.insert(pool.available, obj)  -- push onto available list for reuse
-	while #pool.available > config.perf.maxpools do  -- trim if we exceeded configured cache size
-		local oldest = table.remove(pool.available, 1)  -- remove oldest cached object first
-		if oldest and oldest.part then
-			oldest.part:Destroy()  -- fully destroy underlying instance to free memory
-		end
-	end
-end
-
--- cleanup helper: forcibly clear oldest active objects to recover perf
-local function trim_active(count)  -- remove `count` oldest active items to reduce load
-	for i = 1, count do
-		local oldest = table.remove(pool.active, 1)  -- remove from front which holds oldest by insertion order
-		if oldest then
-			return_to_pool(oldest)  -- return each removed item to available list
-		else
-			break
-		end
-	end
-end
-
--- =========================================================
--- Raycast helpers: smart skipping of visual or transient parts
--- =========================================================
-local function make_rayparams(base_ignore)  -- build a RaycastParams configured for our logic
-	local params = RaycastParams.new()  -- instantiate new params object per-call to avoid mutating shared state
-	params.FilterType = Enum.RaycastFilterType.Exclude  -- we provide a list of instances to exclude from hits
-	params.IgnoreWater = true  -- ignore water surfaces to avoid spurious hits
-	params.RespectCanCollide = true  -- respect cancollide to avoid passing through non-collidable parts
-	params.FilterDescendantsInstances = base_ignore or {}  -- set initial ignore list if provided
-	return params  -- return configured params for use in raycasts
-end
-
-local function add_players_and_npcs_to_blacklist(list)  -- append characters and npc models to a filter list
-	for _, p in ipairs(Players:GetPlayers()) do  -- iterate current players list
-		if p.Character then
-			table.insert(list, p.Character)  -- exclude player character hierarchies to avoid self-hits
-		end
-	end
-	local npcfolder = Workspace:FindFirstChild(config.folders.npcs)  -- optional npc folder lookup
-	if npcfolder then
-		for _, m in ipairs(npcfolder:GetChildren()) do
-			if m:IsA("Model") then
-				table.insert(list, m)  -- exclude npc models if present
-			end
-		end
-	end
-end
-
-local function smartraycast(origin, direction, params)  -- raycast that can penetrate transparent/ghost parts
-	local current = origin  -- current start point for the next ray segment
-	local remaining = direction.Magnitude  -- total distance left to travel
-	if remaining <= 0 then return nil end  -- nothing to raycast if zero length
-	local unit = direction.Unit  -- normalized direction vector for repeated stepping
-	for attempt = 1, config.raycast.attempts do  -- loop attempts up to configured penetration count
-		if remaining <= 0 then break end  -- break early if we've exhausted distance
-		local dist = math.min(remaining, config.perf.raydistance)  -- clamp segment length to perf setting
-		local result = Workspace:Raycast(current, unit * dist, params)  -- perform raycast for this segment
-		if not result then
-			break  -- no hit in this segment, ray exits into empty space
-		end
-		local part = result.Instance  -- the part that was hit
-		if part and part.Transparency < 1 and part.CanCollide then
-			return result  -- valid physical hit, return raycast result to caller
-		end
-		local traveled = (result.Position - current).Magnitude  -- how far we moved this segment
-		current = result.Position + unit * config.raycast.penetration  -- step forward a bit to continue ray beyond the hit
-		remaining = remaining - (traveled + config.raycast.penetration)  -- reduce remaining distance including penetration step
-		local blacklist = params.FilterDescendantsInstances or {}  -- get current blacklist
-		table.insert(blacklist, part)  -- add the hit part so next segment ignores it
-		params.FilterDescendantsInstances = blacklist  -- reassign list back into params so next Raycast sees it
-	end
-	return nil  -- if loop finishes without a valid collidable hit, return nil
-end
-
--- =======================================================
--- math utilities for surface alignment and randomization
--- =======================================================
-local function getsurfacecframe(pos, normal)  -- construct a cframe aligned to surface normal
-	local up = Vector3.new(0, 1, 0)  -- world up vector used as stable reference
-	if math.abs(normal:Dot(up)) > 0.998 then  -- if normal is nearly parallel to up, avoid degenerate cross products
-		return CFrame.new(pos)  -- return simple cframe at position with default orientation
-	end
-	local right = up:Cross(normal).Unit  -- compute right axis by crossing up with normal and normalize
-	local forward = normal:Cross(right).Unit  -- forward axis orthogonal to right and normal
-	return CFrame.fromMatrix(pos, right, normal, forward)  -- build cframe from three axis vectors and position
-end
-
-local function jitter_vector(scale)  -- small random vector generator centered at zero
-	return Vector3.new((math.random() - 0.5) * 2 * scale, (math.random() - 0.5) * 2 * scale, (math.random() - 0.5) * 2 * scale)
-	-- uses math.random uniform in [0,1), remapped to [-scale, scale] per component
-end
-
--- ======================================================
--- material awareness: lifetimes and behavior modifiers
--- ======================================================
-local function material_lifetime_multiplier(material)  -- tweak lifetimes based on material heuristics
-	if material == Enum.Material.Metal then
-		return 0.6  -- metal reduces lifetime, e.g. blood dries faster on metal
-	elseif material == Enum.Material.Grass or material == Enum.Material.Fabric or material == Enum.Material.LeafyGrass then
-		return 1.25  -- soft surfaces hold blood longer
-	elseif material == Enum.Material.Sand then
-		return 1.15  -- sand slightly increases lifetime
-	else
-		return 1  -- default multiplier
-	end
-end
-
--- ==================================================
--- physics droplets pool (small dynamic parts to simulate drips)
--- ==================================================
-local dropletPool = {  -- separate pool for small physics droplets to avoid frequent new/destroy
-	available = {},
-	active = {},
-	total = 0,
-}
-
-local function create_droplet_part()  -- create a lightweight droplet part template on demand
-	local p = Instance.new("Part")  -- create instance directly to avoid reliance on templates
-	p.Shape = Enum.PartType.Ball  -- spherical droplet
-	p.Size = Vector3.new(0.16, 0.16, 0.16)  -- small radius consistent with visual scale
-	p.Material = Enum.Material.SmoothPlastic  -- cheap material for predictable shading
-	p.Color = Color3.fromRGB(110, 0, 0)  -- deep red color for droplet
-	p.CanCollide = true  -- enable collisions so droplets bounce/land
-	p.CastShadow = false  -- disable shadows to reduce rendering cost
-	return p
-end
-
-local function get_droplet()  -- pop or create droplet instance for physics spawn
-	local d = table.remove(dropletPool.available)
-	if not d then
-		d = create_droplet_part()  -- allocate on demand if none available
-		dropletPool.total = dropletPool.total + 1
-	end
-	table.insert(dropletPool.active, d)  -- track in active list to manage lifecycle
-	return d
-end
-
-local function return_droplet(d)  -- return droplet to available pool after use
-	for i, v in ipairs(dropletPool.active) do
-		if v == d then
-			table.remove(dropletPool.active, i)
-			break
-		end
-	end
-	if d and d.Parent then
-		d.Parent = nil  -- detach from workspace so it's not rendered or simulated
-	end
-	table.insert(dropletPool.available, d)  -- push onto available stack
-	if #dropletPool.available > 120 then  -- crude cap to limit memory usage
-		local old = table.remove(dropletPool.available, 1)
-		if old then old:Destroy() end  -- destroy oldest to free resources
-	end
-end
-
-local function spawn_physics_droplet(pos)  -- spawn a single physics droplet at world position
-	local d = get_droplet()  -- acquire droplet instance from pool
-	d.CFrame = CFrame.new(pos)  -- position droplet in world
-	d.Parent = Workspace:FindFirstChild(config.folders.blood) or Workspace  -- parent inside blood folder if present
-	d.Velocity = Vector3.new(math.random(-8,8), -math.random(30,70), math.random(-8,8))  -- give initial velocity for drop arc
-	d.Anchored = false  -- let physics simulate movement
-	Debris:AddItem(d, 4.5)  -- schedule removal from world after physics settles
-	task.delay(4.8, function()  -- after a slight buffer, return to pool if still present
-		if d and d.Parent then
-			return_droplet(d)
-		end
-	end)
-end
-
--- =====================================================
--- create blood decal/pool and schedule fade/cleanup
--- =====================================================
-local function createblooddecal(hitpos, normal, template, material)  -- create decal aligned to surface and schedule fade
-	local basecframe = getsurfacecframe(hitpos, normal)  -- compute surface-aligned cframe for decal placement
-	local randrot = CFrame.Angles(0, math.rad(math.random(0,360)), 0)  -- random yaw rotation to vary decal orientation
-	local finalcframe = basecframe * randrot * CFrame.new(0, 0.01, 0)  -- offset slightly above surface to avoid z-fighting
-	local size = Vector3.new(math.random(12,28)/10, 0.06, math.random(12,28)/10)  -- randomized decal size for variety
-	local obj = get_from_pool(template)  -- obtain pooled BloodObj bound to template part
-	obj:activate(finalcframe, size, true)  -- activate object in world with computed transform and size
-	local mult = material_lifetime_multiplier(material)  -- adjust lifetime by material heuristics
-	local life = config.blood.lifetime * mult  -- compute actual life duration before fade
-	local fade = config.blood.fadeout * mult  -- compute fade duration
-	task.delay(life, function()  -- schedule fade after computed life time
-		if not obj.active or not obj.part then return end  -- guard if already removed or destroyed
-		local tw = TweenService:Create(obj.part, TweenInfo.new(fade, Enum.EasingStyle.Linear), {Transparency = 1})  -- tween transparency to 1
-		tw:Play()  -- start tween
-		tw.Completed:Connect(function()  -- when fade complete, recycle object
-			return_to_pool(obj)
-		end)
-	end)
-	return obj  -- caller may use returned object (e.g. to play sound)
-end
-
--- =====================================================
--- spawn blood for a damage event: multiple rays + effects
--- =====================================================
-local function spawnblood(rootpart, template, isnpc)  -- spawn several splatters around a rootpart
-	if #pool.active >= config.perf.maxdrops then  -- early exit to avoid creating more than allowed
-		return
-	end
-	local count = isnpc and 1 or config.blood.dropcount  -- reduce rays for npcs vs players
-	local played_sound = false  -- ensure only one sound plays per event to avoid spam
-	for i = 1, count do  -- iterate raycasts per configured count
-		local offset = Vector3.new(math.random(-18,18)/10, 0, math.random(-18,18)/10)  -- random horizontal offset
-		local origin = rootpart.Position + Vector3.new(0, 42, 0) + offset  -- start ray high above target to sample surfaces
-		local params = make_rayparams({})  -- fresh rayparams per ray for independent filtering
-		add_players_and_npcs_to_blacklist(params.FilterDescendantsInstances)  -- add characters/npcs into exclude list
-		local result = smartraycast(origin, Vector3.new(0, -config.perf.raydistance, 0), params)  -- cast downwards
-		if result then  -- if a surface was hit
-			local created = createblooddecal(result.Position, result.Normal, template, result.Material)  -- place decal at hit
-			if math.random() < 0.6 then  -- probabilistic droplet spawn for variety
-				spawn_physics_droplet(result.Position + Vector3.new(0,1.8,0))
-			end
-			for j = 1, config.blood.droplets_per_hit do  -- spawn a few more randomized droplets
-				if math.random() < 0.45 then
-					spawn_physics_droplet(result.Position + Vector3.new(math.random(-6,6)/10, 1 + math.random(0,50)/100, math.random(-6,6)/10))
-				end
-			end
-			if not played_sound and created.part and created.part:FindFirstChild("Sound") then  -- one-shot sound per multi-hit spawn
-				created.part.Sound:Play()  -- play sound instance parented under template part
-				played_sound = true
-			end
-			local intensity = math.clamp(1 - (i / math.max(1, count)), 0.2, 1)  -- compute intensity scalar based on iteration index
-			bloodfxevent:FireAllClients(result.Position, intensity)  -- notify clients for local-only effects like screensplatter
-		end
-		task.wait(0.045 + math.random() * 0.03)  -- small stagger to spread ray work across frames and avoid hitches
-	end
-end
-
--- =====================================================
--- death pool: larger pool created when humanoid dies
--- =====================================================
-local function createdeathpool(pos, template)  -- create a larger puddle at approximate ground below pos
-	local params = make_rayparams({})  -- fresh rayparams
-	add_players_and_npcs_to_blacklist(params.FilterDescendantsInstances)  -- exclude characters/npcs
-	local result = Workspace:Raycast(pos + Vector3.new(0,10,0), Vector3.new(0, -config.perf.raydistance, 0), params)  -- straight down ray to find ground
-	if not result then return end  -- abort if no ground found
-	local poolobj = get_from_pool(template)  -- reuse pooled object for pool decal
-	local basec = CFrame.new(result.Position + Vector3.new(0, 0.002, 0))  -- tiny offset to avoid z-fighting
-	poolobj:activate(basec, Vector3.new(1, 0.1, 1), true)  -- activate with small initial size
-	local expand = TweenService:Create(poolobj.part, TweenInfo.new(0.9, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {Size = config.blood.poolsize})  -- tween expand
-	expand:Play()  -- start pool expansion animation
-	local mult = material_lifetime_multiplier(result.Material)  -- adapt lifetime to surface material
-	task.delay(config.blood.lifetime * mult, function()  -- schedule fade after lifetime
-		local f = TweenService:Create(poolobj.part, TweenInfo.new(config.blood.fadeout * mult, Enum.EasingStyle.Linear), {Transparency = 1})
-		f:Play()
-		f.Completed:Connect(function()
-			return_to_pool(poolobj)  -- recycle after fade completes
-		end)
-	end)
-end
-
--- =====================================================
--- setup particle attachment per character for emitters
--- =====================================================
-local function setupparticleattachment(character, template)  -- clone attachment template into character torso
-	local torso = character:FindFirstChild("UpperTorso") or character:FindFirstChild("Torso")  -- prefer r15 upper torso then r6 torso
-	if not torso then
-		warn("setupparticleattachment: torso not found for", character.Name)  -- diagnostic if no torso present
-		return nil
-	end
-	local existing = torso:FindFirstChild("blood_attachment")  -- check for existing attachment to avoid duplicates
-	if existing and existing:IsA("Attachment") then
-		return existing  -- reuse existing attachment rather than cloning again
-	end
-	local attach = template:Clone()  -- clone configured attachment template containing particle emitters
-	attach.Name = "blood_attachment"  -- name consistently so we can find it later
-	attach.Parent = torso  -- parent into torso so its particles follow the rig
-	attach.Position = Vector3.new(0, 0.2, 0)  -- small offset above center of torso for emitter origin
-	return attach
-end
-
--- =====================================================
--- humanoid hook: listens for health changes and reacts
--- =====================================================
-local function hookhumanoid(humanoid, template, attachtemplate)  -- attach vfx logic to a humanoid instance
-	if humanoid:GetAttribute("blood_vfx_active") then
-		return  -- prevent duplicate hooking if already flagged
-	end
-	humanoid:SetAttribute("blood_vfx_active", true)  -- mark humanoid as instrumented to avoid re-hooking
-	local character = humanoid.Parent  -- character model that owns the humanoid
-	if not character then return end
-	local root = character:FindFirstChild("HumanoidRootPart") or character:FindFirstChild("HumanoidRootPart")  -- look for hrp, duplicate fallback kept for clarity
-	if not root then
-		warn("hookhumanoid: rootpart missing for", character.Name)  -- diagnostic warning for unexpected rigs
-		return
-	end
-	local prev_health = humanoid.Health  -- store initial health to detect damage deltas
-	local is_dead = false  -- helper flag to avoid double-handling death case
-	local player = Players:GetPlayerFromCharacter(character)  -- nil for npcs, player object for player characters
-	local isnpc = (player == nil)  -- boolean shorthand used by spawnblood
-	local attachment = setupparticleattachment(character, attachtemplate)  -- attach particle emitters if template provided
-	if not attachment then
-		warn("no attachment for", character.Name, "particles will be limited")  -- warn but continue, particles optional
-	end
-	local conn
-	conn = humanoid.HealthChanged:Connect(function(current)  -- connect to HealthChanged for damage/death detection
-		if is_dead then return end  -- ignore further changes once death has been processed
-		if current < prev_health then  -- health decreased -> damage event
-			if attachment then
-				for _, child in ipairs(attachment:GetChildren()) do  -- iterate emitter children and emit configured counts
-					if child:IsA("ParticleEmitter") then
-						local emitcount = child:GetAttribute("emit_count") or config.blood.emitcount  -- prefer emitter attribute override
-						child:Emit(emitcount)  -- trigger local particle burst, this runs on server side but particles are local-rendered for attachments
-					end
-				end
-			end
-			spawnblood(root, template, isnpc)  -- spawn decals / droplets around the damaged rootpart
-		elseif current <= 0 and not is_dead then  -- health dropped to zero or below -> death event
-			is_dead = true  -- mark to prevent repeated death handling
-			createdeathpool(root.Position, template)  -- spawn a larger puddle at death location
-		end
-		prev_health = current  -- update previous health snapshot for next change
-	end)
-	character.AncestryChanged:Connect(function(_, parent)  -- cleanup listener when character is removed from workspace
-		if not parent then
-			if conn and conn.Connected then
-				conn:Disconnect()  -- disconnect health changed to avoid leaks
-			end
-		end
-	end)
-end
-
--- =====================================================
--- initialize: create folders, hook players and NPCs, install local script
--- =====================================================
-local function ensure_folder(name)  -- ensure workspace has a folder for blood assets
-	local f = Workspace:FindFirstChild(name)  -- try to find existing folder
-	if not f then
-		f = Instance.new("Folder")  -- create new folder if absent
-		f.Name = name  -- set name from config so reviewers can find it
-		f.Parent = Workspace  -- parent into workspace for organization
-	end
-	return f  -- return folder reference for further use
-end
-
-local function install_local_script_for_player(player)  -- create a LocalScript in PlayerScripts to handle client-only effects
-	local success, err = pcall(function()  -- pcall to avoid runtime errors breaking server init
-		local playerScripts = player:WaitForChild("PlayerScripts", 10)  -- wait up to 10s for PlayerScripts container
-		if not playerScripts then return end  -- bail if it didn't appear in time
-		if playerScripts:FindFirstChild(config.local_script_name) then return end  -- don't install twice
-		local ls = Instance.new("LocalScript")  -- create local script instance to be placed into player context
-		ls.Name = config.local_script_name  -- set consistent name so it can be identified
-		ls.Parent = playerScripts  -- parent inside PlayerScripts so it runs in the client's environment
-		ls.Source = [[
-local ReplicatedStorage = game:GetService("ReplicatedStorage")  -- client side replica of replicatedstorage
-local Players = game:GetService("Players")  -- client players service
-local RunService = game:GetService("RunService")  -- used for renderstepped connection for camera shake
-local Workspace = game:GetService("Workspace")  -- client workspace reference
-local plr = Players.LocalPlayer  -- localplayer reference available only in LocalScript
-local cam = Workspace.CurrentCamera  -- cache camera for small transforms
-local event = ReplicatedStorage:WaitForChild("BloodFXEvent")  -- wait for remote event to exist
-local function tinycamshake(intensity, duration)  -- short cam shake implemented on render loop
-	local t0 = tick()
-	local orig = cam.CFrame
-	local function step()
-		local dt = tick() - t0
-		if dt > duration then
-			cam.CFrame = orig  -- restore original camera when done
-			return false
-		end
-		local amt = (1 - (dt / duration)) * intensity * 0.006  -- scale amount over time
-		local rx = math.rad((math.random() - 0.5) * 2 * 10 * amt)
-		local ry = math.rad((math.random() - 0.5) * 2 * 10 * amt)
-		cam.CFrame = orig * CFrame.Angles(rx, ry, 0)  -- apply small random rotation
+--[[
+	Determines if a given part belongs to a character (player or NPC).
+	This is done by checking:
+	- If the part is inside the "Npcs" folder.
+	- If its parent chain contains a Humanoid.
+	- If its name matches typical character body part names.
+]]
+local function isPartOfCharacter(part: BasePart): boolean
+	-- Check if part belongs to the "Npcs" folder (which holds all NPCs)
+	if part:IsDescendantOf(Workspace:FindFirstChild("Npcs") or game) then
 		return true
 	end
-	local conn
-	conn = RunService.RenderStepped:Connect(function()
-		if not step() then
-			conn:Disconnect()  -- disconnect when shaking finished
+
+	-- Traverse up the ancestry tree to check for a Humanoid in parent hierarchy
+	local parent = part.Parent
+	while parent do
+		if parent:FindFirstChildWhichIsA("Humanoid") then
+			return true
 		end
-	end)
-end
-local function screensplatter(intensity)  -- api layer for potential future splatter visuals
-	tinycamshake(intensity or 0.5, 0.18 + (intensity or 0.5) * 0.12)
-end
-event.OnClientEvent:Connect(function(position, intensity)  -- called from server to trigger client-only feedback
-	local char = plr.Character
-	local hrp = char and char:FindFirstChild("HumanoidRootPart")
-	if not hrp then
-		screensplatter(intensity)  -- if no character, still play small effect
-		return
+		if parent == Workspace then
+			break
+		end
+		parent = parent.Parent
 	end
-	local dist = (hrp.Position - position).Magnitude  -- compute world distance from player to effect origin
-	local maxdist = 60  -- max distance where effects are audible/visible
-	local falloff = math.clamp(1 - (dist / maxdist), 0, 1)  -- linear falloff to zero at maxdist
-	local final_intensity = math.clamp((intensity or 0.6) * falloff, 0.08, 1)  -- clamp final intensity to sane bounds
-	if final_intensity > 0.09 then
-		screensplatter(final_intensity)  -- play camera shake if intensity above threshold
+
+	-- Convert name to lowercase to ensure matching is case-insensitive
+	local name = part.Name:lower()
+
+	-- Match against known character body part naming patterns
+	if name:match("torso") or name:match("head") or name:match("arm") or
+		name:match("leg") or name:match("humanoidrootpart") then
+		return true
 	end
-end)
-		]]  -- end of localscript source block
-	end)
-	if not success then
-		warn("Failed to install local script for player:", player.Name, err)  -- report pcall error for debugging
-	end
+
+	return false
 end
 
-local function initialize()  -- main setup function called once at script start
-	ensure_folder(config.folders.blood)  -- ensure folder exists for blood parts
-	local bloodtemplate = script:WaitForChild("blood")  -- wait for required template part as child of this script
-	local attachtemplate = script:WaitForChild("attachment")  -- wait for attachment template containing emitters
-	for _, plr in ipairs(Players:GetPlayers()) do  -- iterate currently connected players to initialize existing sessions
-		if plr.Character then
-			local hum = plr.Character:FindFirstChildWhichIsA("Humanoid")
-			if hum then
-				hookhumanoid(hum, bloodtemplate, attachtemplate)  -- hook current player's humanoid for vfx
+
+--[[
+	Casts multiple downward raycasts to find a solid ground surface under a given position.
+	Skips over non-ground objects like characters or transparent parts.
+]]
+local function findGroundBelowPosition(origin: Vector3)
+	-- Starting the ray slightly above the origin prevents it from instantly colliding with the body
+	local startPosition = Vector3.new(origin.X, origin.Y + 20, origin.Z)
+
+	-- Iterate multiple times downward to ensure we find actual ground
+	for _ = 1, 50 do
+		-- Create a RaycastParams each iteration (to ensure fresh context)
+		local params = RaycastParams.new()
+		local result = Workspace:Raycast(startPosition, Vector3.new(0, -1000, 0), params)
+
+		-- If nothing was hit, stop the search
+		if not result then
+			return nil
+		end
+
+		local hitPart = result.Instance
+
+		-- Validate that the hit part is a visible, collidable surface
+		if hitPart.Transparency < 1 and hitPart.CanCollide then
+			-- Ensure it's not a body part or existing blood decal
+			if not isPartOfCharacter(hitPart) and not hitPart:IsDescendantOf(Workspace:FindFirstChild("BloodFolder") or game) then
+				return result
 			end
 		end
-		install_local_script_for_player(plr)  -- ensure local script installed for current player
+
+		-- Move the next ray slightly below the previous hit point
+		startPosition = result.Position + Vector3.new(0, -1, 0)
 	end
-	Players.PlayerAdded:Connect(function(plr)  -- handle players joining after script startup
-		install_local_script_for_player(plr)  -- install local script when they arrive
-		plr.CharacterAdded:Connect(function(char)  -- hook new characters as they spawn
-			local hum = char:WaitForChild("Humanoid", 5)  -- wait short time for humanoid to exist
-			if hum then
-				hookhumanoid(hum, bloodtemplate, attachtemplate)
+
+	return nil
+end
+
+
+--[[
+	Creates a large blood pool on the ground after a death event.
+	This uses tweening for a smooth expansion and fading effect.
+]]
+local function createDeathBloodPool(origin: Vector3)
+	local groundResult = findGroundBelowPosition(origin)
+	if not groundResult then
+		warn("No valid ground found for blood pool.")
+		return
+	end
+
+	local groundPos = groundResult.Position
+
+	-- Clone the base “Blood” part from the script for the new pool
+	local pool = script:WaitForChild("Blood"):Clone()
+	pool.Size = Vector3.new(9, 0.25, 7)
+	pool.Position = Vector3.new(groundPos.X, groundPos.Y + 0.05, groundPos.Z)
+	pool.Anchored = true
+	pool.CanCollide = false
+	pool.CanTouch = false
+	pool.CanQuery = false
+	pool.Transparency = 0
+	pool.Parent = Workspace:WaitForChild("BloodFolder")
+
+	-- Tween to shrink slightly to simulate liquid spreading
+	local growTween = TweenService:Create(
+		pool,
+		TweenInfo.new(0.8, Enum.EasingStyle.Sine, Enum.EasingDirection.Out),
+		{ Size = Vector3.new(7, 0.1, 7) }
+	)
+	growTween:Play()
+
+	-- Delay fading process until the configured lifetime expires
+	delay(BLOOD_DELAY, function()
+		local fadeTween = TweenService:Create(
+			pool,
+			TweenInfo.new(2, Enum.EasingStyle.Linear),
+			{ Transparency = 1 }
+		)
+		fadeTween:Play()
+
+		-- Once fully faded, destroy the object to clean memory
+		fadeTween.Completed:Connect(function()
+			if pool and pool:IsDescendantOf(game) then
+				pool:Destroy()
 			end
 		end)
 	end)
-	local npcfolder = Workspace:FindFirstChild(config.folders.npcs)  -- check for npc folder in workspace
-	if not npcfolder then
-		npcfolder = Instance.new("Folder")  -- create folder if absent
-		npcfolder.Name = config.folders.npcs
-		npcfolder.Parent = Workspace
-		npcfolder = Workspace:FindFirstChild(config.folders.npcs)  -- re-resolve to ensure consistent reference
-	else
-		npcfolder = npcfolder  -- reuse found reference
+end
+
+
+--[[
+	Helper function that fades out any given part smoothly using TweenService.
+	After fading, the part is destroyed to free memory.
+]]
+local function fadeOutAndDestroy(part: BasePart, duration: number)
+	if not (part and part:IsDescendantOf(game)) then
+		return
 	end
-	for _, child in ipairs(npcfolder:GetChildren()) do  -- instrument existing npc models in folder
-		if child:IsA("Model") then
-			local hum = child:FindFirstChildWhichIsA("Humanoid")
-			if hum then
-				hookhumanoid(hum, bloodtemplate, attachtemplate)
-			end
+
+	local fadeTween = TweenService:Create(
+		part,
+		TweenInfo.new(duration, Enum.EasingStyle.Linear),
+		{ Transparency = 1 }
+	)
+	fadeTween:Play()
+
+	fadeTween.Completed:Connect(function()
+		if part and part:IsDescendantOf(game) then
+			part:Destroy()
 		end
+	end)
+end
+
+
+--[[
+	Generates an individual blood drop part on the ground.
+	Randomizes size and orientation for variation.
+]]
+local function createBloodDrop(position: Vector3): BasePart
+	local clone = script:WaitForChild("Blood"):Clone()
+
+	-- Randomize XZ scale for natural variation
+	local size = math.random(13, 30) / 10
+	clone.Size = Vector3.new(size, 0.13, size)
+	clone.Position = position + Vector3.new(0, 0.01, 0)
+	clone.Orientation = Vector3.new(0, math.random(0, 360), 0)
+
+	-- Disable physics and collision for performance
+	clone.Anchored = true
+	clone.CanCollide = false
+	clone.CanTouch = false
+	clone.CanQuery = false
+	clone.Transparency = 0
+	clone.Parent = Workspace:WaitForChild("BloodFolder")
+
+	return clone
+end
+
+
+--[[
+	Spawns multiple blood drops around a character’s root part position.
+	Handles both NPCs and players, accounting for their different intensities.
+]]
+local function spawnBloodDrops(rootPart: BasePart, isNPC: boolean)
+	local totalDrops = isNPC and 1 or BLOOD_PER_HIT
+	local playedSound = false
+
+	for _ = 1, totalDrops do
+		-- Random horizontal offset for spread
+		local offset = Vector3.new(math.random(-20, 20) / 10, 0, math.random(-20, 20) / 10)
+		local origin = rootPart.Position + offset
+
+		local groundResult = findGroundBelowPosition(origin)
+		if groundResult then
+			local hitPosition = groundResult.Position
+			local normal = groundResult.Normal
+
+			-- Create and position the blood decal
+			local drop = createBloodDrop(hitPosition)
+			drop.Position = hitPosition + Vector3.new(0, drop.Size.Y / 2, 0)
+
+			-- Rotate blood decal to align with the ground slope using axis-angle rotation
+			if normal then
+				local upVector = Vector3.new(0, 1, 0)
+				local axis = upVector:Cross(normal)
+				local angle = math.acos(upVector:Dot(normal))
+				if axis.Magnitude > 0 and angle > 0 then
+					drop.CFrame = CFrame.new(drop.Position) * CFrame.fromAxisAngle(axis.Unit, angle)
+				end
+			end
+
+			-- Play sound effect once per emission cycle
+			if not playedSound and drop:FindFirstChild("Sound") then
+				drop.Sound:Play()
+				playedSound = true
+			end
+
+			-- Delay fade to allow the drop to persist for a while
+			delay(BLOOD_DELAY, function()
+				fadeOutAndDestroy(drop, 1)
+			end)
+		end
+
+		-- Slight wait between drops for realism and performance
+		task.wait(math.random(5, 15) / 100)
 	end
-	npcfolder.ChildAdded:Connect(function(c)  -- handle npc models added later at runtime
-		task.wait(0.25)  -- small wait to allow model children to initialize
-		local hum = c:FindFirstChildWhichIsA("Humanoid")
-		if hum then
-			hookhumanoid(hum, bloodtemplate, attachtemplate)
+end
+
+
+--[[
+	Attaches event listeners to a humanoid so blood effects trigger upon damage or death.
+]]
+local function hookHumanoid(humanoid: Humanoid)
+	-- Prevent multiple bindings to the same humanoid
+	if humanoid:GetAttribute("BloodSystemHooked") then
+		return
+	end
+	humanoid:SetAttribute("BloodSystemHooked", true)
+
+	local character = humanoid.Parent
+	if not character then return end
+
+	local rootPart = character:FindFirstChild("HumanoidRootPart")
+	if not rootPart then return end
+
+	local oldHealth = humanoid.Health
+	local isDead = false
+	local player = Players:GetPlayerFromCharacter(character)
+	local isNPC = not player
+
+	-- Attach particle emitter system for active bleeding
+	local attachment = rootPart:FindFirstChild("BloodAttachment") or script:WaitForChild("Attachment"):Clone()
+	attachment.Name = "BloodAttachment"
+	attachment.Parent = rootPart
+
+	-- React to any changes in the humanoid's health
+	humanoid.HealthChanged:Connect(function(newHealth)
+		if isDead then return end
+
+		-- Detect decrease in health (damage event)
+		if newHealth < oldHealth then
+			oldHealth = newHealth
+
+			-- Emit configured number of blood particles from the attachment
+			for _, emitter in ipairs(attachment:GetChildren()) do
+				if emitter:IsA("ParticleEmitter") then
+					emitter:Emit(emitter:GetAttribute("EmitCount") or emitter.Rate)
+				end
+			end
+
+			spawnBloodDrops(rootPart, isNPC)
+
+		-- Detect death event (health <= 0)
+		elseif newHealth <= 0 then
+			isDead = true
+			local deathPosition = rootPart.Position
+
+			-- Small delay to allow the character to settle before pooling blood
+			task.wait(1.5)
+			createDeathBloodPool(deathPosition)
 		else
-			local timeout = 8
-			local conn
-			conn = c.ChildAdded:Connect(function(sub)  -- connect to childadded to catch delayed humanoid insertion
-				if sub:IsA("Humanoid") then
-					hookhumanoid(sub, bloodtemplate, attachtemplate)
-					conn:Disconnect()
-				end
-			end)
-			task.delay(timeout, function()  -- cleanup connection if humanoid never appears
-				if conn then conn:Disconnect() end
-			end)
+			oldHealth = newHealth
 		end
 	end)
-	RunService.Heartbeat:Connect(function()  -- heartbeat used to enforce soft performance caps each frame
-		if #pool.active > (config.perf.maxdrops * 1.4) then  -- if active pool exceeds threshold, trim to recover
-			warn("blood vfx: high active object count, trimming oldest items to recover performance")
-			trim_active(12)  -- remove a batch of oldest items
+end
+
+
+--[[
+	Scans all NPCs in the "Npcs" folder and attaches blood system to each.
+]]
+local function hookAllNPCsInFolder()
+	local npcFolder = Workspace:WaitForChild("Npcs")
+
+	for _, npc in ipairs(npcFolder:GetChildren()) do
+		if npc:IsA("Model") then
+			local humanoid = npc:FindFirstChildWhichIsA("Humanoid")
+			if humanoid then
+				hookHumanoid(humanoid)
+			end
 		end
-		if #dropletPool.active > 250 then  -- droplet active cap to keep physics count manageable
-			for i = 1, 24 do
-				local oldest = table.remove(dropletPool.active, 1)
-				if oldest then
-					if oldest.Parent then oldest.Parent = nil end  -- detach rather than destroy for fast reuse
-					table.insert(dropletPool.available, oldest)
-				else
-					break
-				end
+	end
+end
+
+
+--[[
+	Sets up monitoring for new NPCs being added dynamically to the Npcs folder.
+]]
+local function setupNPCMonitoring()
+	local npcFolder = Workspace:WaitForChild("Npcs")
+
+	-- Initial hookup for existing NPCs
+	hookAllNPCsInFolder()
+
+	-- Listen for any new NPC models being added
+	npcFolder.ChildAdded:Connect(function(child)
+		if child:IsA("Model") then
+			task.wait(0.2)
+
+			local humanoid = child:FindFirstChildWhichIsA("Humanoid")
+			if humanoid then
+				hookHumanoid(humanoid)
+			else
+				-- If humanoid isn’t present immediately, monitor for one
+				local connection
+				connection = child.ChildAdded:Connect(function(subChild)
+					if subChild:IsA("Humanoid") then
+						hookHumanoid(subChild)
+						connection:Disconnect()
+					end
+				end)
+
+				-- Disconnect the listener after 10 seconds to avoid leaks
+				task.delay(10, function()
+					if connection then
+						connection:Disconnect()
+					end
+				end)
 			end
 		end
 	end)
 end
 
--- start the system
-initialize()  -- call initialize to wire everything up immediately when script runs
 
--- Example helper function for reviewers to programmatically trigger an effect for testing
-local function debug_spawn_at_position(position)  -- convenience debug api to force spawn for QA reviewers
-	local bloodtemplate = script:FindFirstChild("blood")
-	if not bloodtemplate then return end
-	createdeathpool(position, bloodtemplate)  -- create a large pool at position for inspection
-	for i = 1, 8 do
-		spawn_physics_droplet(position + Vector3.new(math.random(-20,20)/10, 1 + math.random(0,50)/100, math.random(-20,20)/10))
+--//=============================
+--// PLAYER CONNECTIONS
+--//=============================
+
+-- Attach blood system to all players currently in the game
+for _, player in ipairs(Players:GetPlayers()) do
+	if player.Character then
+		local humanoid = player.Character:FindFirstChildWhichIsA("Humanoid")
+		if humanoid then
+			hookHumanoid(humanoid)
+		end
 	end
 end
 
--- Bind to a simple BindableEvent if present for in-studio testing convenience
-local debugEvent = script:FindFirstChild("DebugSpawn")
-if debugEvent and debugEvent:IsA("BindableEvent") then
-	debugEvent.Event:Connect(function(pos)
-		if pos and typeof(pos) == "Vector3" then
-			debug_spawn_at_position(pos)  -- allow designers to fire debug spawn from studio tools
+-- Connect to PlayerAdded event for future players
+Players.PlayerAdded:Connect(function(player)
+	player.CharacterAdded:Connect(function(character)
+		local humanoid = character:WaitForChild("Humanoid", 5)
+		if humanoid then
+			hookHumanoid(humanoid)
 		end
 	end)
-end
+end)
 
--- Final note: script ends here. Add blood & attachment children to this Script and test in a demo place
+-- Start NPC monitoring system
+setupNPCMonitoring()
